@@ -1,10 +1,10 @@
 /**
  * SOL Price Service
  *
- * Helps us get realtime SOL/USD price ticks using Pyth network.
+ * Helps us get realtime SOL/USD price ticks from free public sources:
+ * CoinGecko -> Binance -> Jupiter (in that fallback order).
  */
 
-import { HermesClient } from '@pythnetwork/hermes-client'
 import { logger } from '../../utils/logger.js'
 
 interface PriceCache {
@@ -15,54 +15,82 @@ interface PriceCache {
 const CACHE_TTL_MS = 60 * 1000 // 60 secs
 let priceCache: PriceCache | null = null
 
-// This is a unique idebtifier for each specific pair of assets. SOL/USD, inour case.
-const SOL_USD_PRICE_FEED_ID =
-  '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d'
+// Mint address of native SOL on Solana
+const SOL_MINT = 'So11111111111111111111111111111111111111112'
 
-const hermesClient = new HermesClient('https://hermes.pyth.network', {})
+async function fetchCoinGeckoPrice(): Promise<number> {
+  const res = await fetch(
+    'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
+  )
+  if (!res.ok) throw new Error(`CoinGecko HTTP ${res.status}`)
+  const data = (await res.json()) as { solana?: { usd?: number } }
+  const price = data.solana?.usd
+  if (typeof price !== 'number' || price <= 0 || !Number.isFinite(price))
+    throw new Error('CoinGecko returned invalid price')
+  return price
+}
 
-/**
- * This is used to retrieve the SOL/USD price feed dynamically instead using an hardcoded hash
- * Although, there's a high tendency that the feedId may not even change.
- * This is just safer.
- */
+async function fetchBinancePrice(): Promise<number> {
+  const res = await fetch(
+    'https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT',
+  )
+  if (!res.ok) throw new Error(`Binance HTTP ${res.status}`)
+  const data = (await res.json()) as { price?: string }
+  const price = parseFloat(data.price ?? '')
+  if (typeof price !== 'number' || price <= 0 || !Number.isFinite(price))
+    throw new Error('Binance returned invalid price')
+  return price
+}
+
+async function fetchJupiterPrice(): Promise<number> {
+  const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`)
+  if (!res.ok) throw new Error(`Jupiter HTTP ${res.status}`)
+  const data = (await res.json()) as {
+    [SOL_MINT]?: { usdPrice?: number }
+  }
+  const price = data[SOL_MINT]?.usdPrice
+  if (typeof price !== 'number' || price <= 0 || !Number.isFinite(price))
+    throw new Error('Jupiter returned invalid price')
+  return price
+}
+
+const PRICE_FETCHERS: Array<[string, () => Promise<number>]> = [
+  ['coingecko', fetchCoinGeckoPrice],
+  ['binance', fetchBinancePrice],
+  ['jupiter', fetchJupiterPrice],
+]
+
 export async function getSolPrice(): Promise<number> {
   if (priceCache && Date.now() - priceCache.timestamp < CACHE_TTL_MS)
     return priceCache.price
 
-  try {
-    const priceData = await hermesClient.getLatestPriceUpdates([
-      SOL_USD_PRICE_FEED_ID,
-    ])
+  const errors: string[] = []
 
-    if (!priceData.parsed || priceData.parsed.length === 0)
-      throw new Error('No price data returned')
-    const data = priceData.parsed[0]
+  for (const [source, fetcher] of PRICE_FETCHERS) {
+    try {
+      const price = await fetcher()
 
-    // pyth.network returns price as a string with an exponent
-    // price could be "13392000000", expo=-8 means 133.92 USD
-    const priceValue = parseFloat(data.price.price)
-    const exponent = data.price.expo
-    const price = priceValue * 10 ** exponent
+      priceCache = {
+        price,
+        timestamp: Date.now(),
+      }
 
-    if (typeof price !== 'number' || price <= 0 || !Number.isFinite(price))
-      throw new Error('Invalid price')
-
-    priceCache = {
-      price,
-      timestamp: Date.now(),
+      return price
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      errors.push(`${source}: ${message}`)
+      logger.warn(`SOL price source failed: ${source}`, { error: message })
     }
-
-    return price
-  } catch (error) {
-    logger.error('Failed to fetch SOL price', {
-      error: error instanceof Error ? error.message : String(error),
-    })
-    if (priceCache) {
-      logger.warn('Falling back to stale price data due to an error')
-      return priceCache.price
-    }
-
-    throw new Error('Unable to get SOL price')
   }
+
+  logger.error('All SOL price sources failed', {
+    error: errors.join(' | '),
+  })
+
+  if (priceCache) {
+    logger.warn('Falling back to stale price data due to an error')
+    return priceCache.price
+  }
+
+  throw new Error('Unable to get SOL price')
 }
